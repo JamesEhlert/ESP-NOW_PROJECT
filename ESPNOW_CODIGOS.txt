@@ -1,0 +1,369 @@
+/*
+  ESP32-C3 Super Mini - Transmissor AHT10 + LED controlado por ESP-NOW
+  - Lê AHT10 via I2C (SDA=GPIO8, SCL=GPIO9)
+  - Envia msg sensor via ESP-NOW para a ESP8266 (receiver)
+  - Recebe mensagens de controle (led on/off) e acende/desliga LED
+  - Timeout para desligar LED se keepalive parar (robustez contra perda de pacotes)
+  
+  Pré-requisitos:
+  - Biblioteca Adafruit AHTX0 instalada (Adafruit_AHTX0)
+*/
+
+/* 
+  Transmissor (ESP32-C3 Super Mini)
+  - Lê AHT10 via I2C (SDA=SDA_PIN, SCL=SCL_PIN)
+  - Envia leituras via ESP-NOW (msg.type == 0)
+  - Recebe comandos de controle (msg.type == 1, led = 0/1) e controla LED local
+  - Timeout: se não receber keepalive do receptor, apaga LED
+*/
+
+#include <WiFi.h>
+#include <esp_now.h>
+#include <Wire.h>
+#include <Adafruit_AHTX0.h>
+
+// ====== PINAGEM ======
+#define SDA_PIN 8    // ajuste se sua placa usa outro pino SDA
+#define SCL_PIN 9    // ajuste se sua placa usa outro pino SCL
+#define LED_PIN 4    // pino do LED no transmissor (anodo -> 220R -> pino)
+
+// ====== Biblioteca AHT ======
+Adafruit_AHTX0 aht;
+
+// ====== Estrutura de mensagem (packed para evitar padding) ======
+typedef struct __attribute__((packed)) {
+  uint8_t type;       // 0 = sensor, 1 = control
+  float temperature;  // válido quando type == 0
+  float humidity;     // válido quando type == 0
+  uint8_t led;        // válido quando type == 1 (0 ou 1)
+} msg_t;
+
+msg_t rxMsg; // buffer de recebimento
+
+// ====== Substitua pelo MAC da sua ESP8266 receptor (6 bytes) ======
+uint8_t receiverMAC[6] = {0xEC, 0xFA, 0xBC, 0xD4, 0xE6, 0xA7};
+
+// ====== Timeout / estado LED ======
+bool ledState = false;
+unsigned long lastLedCmdMs = 0;
+const unsigned long LED_TIMEOUT_MS = 600; // ms; apaga LED se não receber keepalive
+
+// ====== CALLBACKS (NOVA ASSINATURA IDF v5/core 3.x) ======
+void OnDataSent(const esp_now_send_info_t *info, esp_now_send_status_t status) {
+  (void)info; // não usamos info aqui; evita "unused" warnings
+  Serial.print("[ESP-NOW] Envio: ");
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Sucesso" : "Falha");
+}
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+  // info->src_addr contém o MAC do remetente
+  char macStr[18];
+  snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+           info->src_addr[0], info->src_addr[1], info->src_addr[2],
+           info->src_addr[3], info->src_addr[4], info->src_addr[5]);
+  Serial.print("[ESP-NOW] Dados recebidos de: ");
+  Serial.println(macStr);
+
+  if (len < (int)sizeof(msg_t)) {
+    Serial.println("Tamanho de mensagem inválido, ignorando.");
+    return;
+  }
+
+  // copia para struct
+  memcpy(&rxMsg, incomingData, sizeof(msg_t));
+
+  // Se receber comando de controle, atualiza LED
+  if (rxMsg.type == 1) {
+    if (rxMsg.led) {
+      digitalWrite(LED_PIN, HIGH);
+      ledState = true;
+      lastLedCmdMs = millis();
+      Serial.println("[CONTROL] LED -> ON (keepalive)");
+    } else {
+      digitalWrite(LED_PIN, LOW);
+      ledState = false;
+      Serial.println("[CONTROL] LED -> OFF (comando explícito)");
+    }
+  } else {
+    // Caso receba sensor (normalmente o receptor não envia sensor)
+    Serial.println("[INFO] Mensagem tipo sensor recebida (ignorada como controle).");
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // I2C + AHT10
+  Wire.begin(SDA_PIN, SCL_PIN);
+  Serial.println("Iniciando AHT10...");
+  if (!aht.begin()) {
+    Serial.println("Erro: AHT10 não detectado. Verifique SDA/SCL e VCC/GND.");
+    // Não damos return; podemos ainda testar ESP-NOW mesmo sem sensor
+  } else {
+    Serial.println("AHT10 OK");
+  }
+
+  // LED
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // WiFi + ESP-NOW
+  WiFi.mode(WIFI_STA);
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("Erro ao inicializar ESP-NOW");
+    return;
+  }
+
+  // registra callbacks (com assinaturas CORRETAS para core 3.x)
+  esp_now_register_send_cb(OnDataSent);
+  esp_now_register_recv_cb(OnDataRecv);
+
+  // Adiciona peer (receptor)
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, receiverMAC, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+    Serial.println("Aviso: falha ao adicionar peer (já pode existir ou erro).");
+  }
+
+  Serial.print("MAC local (Transmissor): ");
+  Serial.println(WiFi.macAddress());
+  Serial.println("Transmissor pronto.");
+}
+
+void loop() {
+  msg_t txMsg;
+  txMsg.type = 0;
+  txMsg.led = 0;
+
+  // lê AHT10
+  sensors_event_t humidity, temp;
+  if (aht.getEvent(&humidity, &temp)) {
+    txMsg.temperature = temp.temperature;
+    txMsg.humidity = humidity.relative_humidity;
+  } else {
+    txMsg.temperature = NAN;
+    txMsg.humidity = NAN;
+    Serial.println("Aviso: leitura AHT10 falhou.");
+  }
+
+  // envia via ESP-NOW
+  esp_err_t r = esp_now_send(receiverMAC, (uint8_t *)&txMsg, sizeof(txMsg));
+  if (r == ESP_OK) {
+    Serial.printf("[ENVIADO] T: %.2f °C | H: %.2f %%\n", txMsg.temperature, txMsg.humidity);
+  } else {
+    Serial.printf("[ERRO ENVIO] código: %d\n", r);
+  }
+
+  // checa timeout do LED (apaga se não chegar keepalive)
+  if (ledState && (millis() - lastLedCmdMs > LED_TIMEOUT_MS)) {
+    digitalWrite(LED_PIN, LOW);
+    ledState = false;
+    Serial.println("[TIMEOUT] Sem keepalive. LED -> OFF");
+  }
+
+  delay(2000); // intervalo de envio (ajustável)
+}
+
+
+///////////////////////////////////////////////////
+
+
+
+
+
+
+
+
+
+//////////////////////////////////////////////
+//////////////////////////
+
+
+
+
+/////////////////////////////////////////////////////
+
+
+
+
+
+/*
+  ESP8266 - Receptor ESP-NOW + OLED (U8g2) + pushbutton
+
+  Correções importantes:
+  - Usar número de GPIO ao invés de "D1" (nem todas as boards definem D1 macro).
+  - No ESP8266, use uint8_t (ou int) para capturar o retorno de esp_now_send().
+  - Compatível com o transmissor ESP32-C3 que você já carregou.
+
+  Ajuste: substitua transmitterMAC[] pelo MAC real do seu ESP32 (veja Serial do ESP32).
+*/
+/*
+  ESP8266 - Receptor ESP-NOW + OLED (U8g2) + pushbutton
+  - Recebe mensagens sensor via ESP-NOW e mostra no OLED (U8g2)
+  - Possui pushbutton ligado a BUTTON_PIN (ex.: GPIO5 / D1).
+    Enquanto pressionado, envia mensagens de controle (led=1) para o ESP32.
+    Ao soltar, envia um comando final (led=0).
+  - Debounce + keepalive period (evita flicker por perda de pacotes)
+*/
+
+#include <ESP8266WiFi.h>
+#include <espnow.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+
+// === OLED SW-I2C (mesma configuração que você usou antes) ===
+U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(
+  U8G2_R0, /*clock=*/12, /*data=*/14, U8X8_PIN_NONE
+);
+
+// === PINAGEM ===
+// Usamos o número do GPIO diretamente para evitar dependência de "D1" macro.
+// GPIO5 corresponde ao pino marcado "D1" em muitas placas (NodeMCU, Wemos).
+#define BUTTON_PIN 5  // GPIO5 (pino do botão entre este pino e GND)
+
+// === Estrutura de mensagem (packed para manter layout idêntico ao ESP32) ===
+typedef struct __attribute__((packed)) {
+  uint8_t type;       // 0 = sensor, 1 = control
+  float temperature;
+  float humidity;
+  uint8_t led;        // 0 ou 1
+} msg_t;
+
+msg_t rxMsg;
+msg_t txMsg;
+
+// === MAC do transmissor (ESP32) - substitua pelo MAC real da sua C3 ===
+uint8_t transmitterMAC[6] = {0x24, 0x6F, 0x28, 0xAB, 0xCD, 0xEF};
+
+// === Timings e debounce ===
+const unsigned long DEBOUNCE_MS = 40;
+const unsigned long KEEPALIVE_INTERVAL_MS = 200; // enquanto segurado, envia a cada 200 ms
+unsigned long lastButtonChangeMs = 0;
+unsigned long lastKeepaliveMs = 0;
+bool lastRawButton = HIGH; // pull-up: HIGH = não pressionado
+bool sendingLedOn = false;
+
+// === Callbacks ESP-NOW (ESP8266 signatures) ===
+void OnDataRecv(uint8_t *mac, uint8_t *incomingData, uint8_t len) {
+  if (len < sizeof(msg_t)) return;
+  memcpy(&rxMsg, incomingData, sizeof(msg_t));
+
+  if (rxMsg.type == 0) {
+    // Mensagem de sensor: atualiza Serial e OLED
+    Serial.printf("[RECEBIDO] Temp: %.2f C | Umid: %.2f %%\n", rxMsg.temperature, rxMsg.humidity);
+
+    // Atualiza OLED (U8g2)
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_7x14B_tr);
+
+    u8g2.setCursor(0, 20);
+    u8g2.print("Temp: ");
+    if (!isnan(rxMsg.temperature)) u8g2.print(rxMsg.temperature, 2);
+    else u8g2.print("N/A");
+    u8g2.print(" C");
+
+    u8g2.setCursor(0, 40);
+    u8g2.print("Umid: ");
+    if (!isnan(rxMsg.humidity)) u8g2.print(rxMsg.humidity, 2);
+    else u8g2.print("N/A");
+    u8g2.print(" %");
+
+    u8g2.sendBuffer();
+  } else if (rxMsg.type == 1) {
+    // Controle vindo do transmissor (normalmente não usado)
+    Serial.printf("[INFO] Mensagem controle recebida (led=%u)\n", rxMsg.led);
+  }
+}
+
+void OnDataSent(uint8_t *mac_addr, uint8_t status) {
+  Serial.print("[ESP-NOW] Envio: ");
+  Serial.println(status == 0 ? "Sucesso" : "Falha");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // Inicializa OLED
+  u8g2.begin();
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_7x14B_tr);
+  u8g2.drawStr(0, 20, "Iniciando...");
+  u8g2.sendBuffer();
+
+  // Configura botão (pull-up interno)
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  lastRawButton = digitalRead(BUTTON_PIN);
+
+  // Inicializa WiFi/ESP-NOW
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != 0) {
+    Serial.println("Erro ao iniciar ESP-NOW!");
+    u8g2.clearBuffer(); u8g2.drawStr(0, 20, "Erro ESP-NOW"); u8g2.sendBuffer();
+    return;
+  }
+
+  // Registra callbacks
+  esp_now_register_recv_cb(OnDataRecv);
+  esp_now_register_send_cb(OnDataSent);
+
+  // Mostra MAC local (útil para copiar no transmissor)
+  Serial.print("MAC desta ESP8266 (Receiver): ");
+  Serial.println(WiFi.macAddress());
+
+  // Mensagem pronta no display
+  u8g2.clearBuffer();
+  u8g2.drawStr(0, 20, "Pronto. Aguardando...");
+  u8g2.sendBuffer();
+  Serial.println("Receptor pronto.");
+}
+
+void loop() {
+  // Leitura do botão com debounce
+  bool raw = digitalRead(BUTTON_PIN);
+  if (raw != lastRawButton) {
+    lastButtonChangeMs = millis();
+    lastRawButton = raw;
+  }
+
+  bool pressed = false;
+  if (millis() - lastButtonChangeMs > DEBOUNCE_MS) {
+    pressed = (digitalRead(BUTTON_PIN) == LOW); // pullup: LOW = pressionado
+  }
+
+  unsigned long now = millis();
+
+  if (pressed) {
+    // Envia keepalive periodicamente enquanto estiver pressionado
+    if (now - lastKeepaliveMs >= KEEPALIVE_INTERVAL_MS) {
+      txMsg.type = 1;
+      txMsg.temperature = 0.0;
+      txMsg.humidity = 0.0;
+      txMsg.led = 1;
+
+      // Na ESP8266, usar uint8_t para o retorno
+      uint8_t r = esp_now_send(transmitterMAC, (uint8_t *)&txMsg, sizeof(txMsg));
+      Serial.println("[CONTROL] Enviando LED=1 (pressionado) -> retorno: " + String(r));
+      lastKeepaliveMs = now;
+      sendingLedOn = true;
+    }
+  } else {
+    // Se acabou de soltar (enviar comando final LED=0)
+    if (sendingLedOn) {
+      txMsg.type = 1;
+      txMsg.temperature = 0.0;
+      txMsg.humidity = 0.0;
+      txMsg.led = 0;
+      uint8_t r = esp_now_send(transmitterMAC, (uint8_t *)&txMsg, sizeof(txMsg));
+      Serial.println("[CONTROL] Enviando LED=0 (soltou) -> retorno: " + String(r));
+      sendingLedOn = false;
+    }
+  }
+
+  delay(10); // loop leve
+}
